@@ -1,0 +1,68 @@
+namespace application ;
+
+type TCPHeader = rstring srcAddressIP, rstring dstAddressIP, uint16 srcPortTCP,
+	uint16 dstPortTCP, float64 captureTime, uint16 payloadLength,
+	boolean flagURGENT, boolean flagACK, boolean flagPUSH, boolean flagRESET,
+	boolean flagSYN, boolean flagFIN, uint16 cppayload ;
+
+composite PCAP_Source(output HeaderStream )
+{
+	param
+		expression $filename ;
+		expression $filter ;
+	graph
+		stream<float64 captureTime, blob rawPacket> PacketStream as Out =
+			streamsx.networkpacket::PacketLiveSource()
+		{//PacketFileSource()
+			param
+				//pcapFilename : $filename ;
+				filterExpression : $filter ;
+				networkInterface: "enp1s0f1";
+			output
+				Out : captureTime = timestampp(), rawPacket = packet() ;
+		}
+
+		stream<TCPHeader> HeaderStream as Out =
+			streamsx.networkpacket::PacketHeaderParser(PacketStream)
+		{	logic
+				state:{
+					mutable int32 i =0;
+				}
+				onTuple PacketStream :{
+					i=i+1;
+					//print(IP_DST_ADDRESS_STRING());
+					//print(",");
+					//print(IP_SRC_ADDRESS_STRING());
+					//print(srcAddressIP);
+					//println(i);
+				}
+			param
+				packetAttribute : rawPacket ;
+			output
+				Out :
+				//srcAddressMAC = ETHER_SRC_ADDRESS_STRING(),
+				//dstAddressMAC = ETHER_DST_ADDRESS_STRING(),
+				//protocolIP = IP_PROTOCOL(),
+				srcAddressIP = IP_SRC_ADDRESS_STRING(), dstAddressIP =
+					IP_DST_ADDRESS_STRING(),
+					//srcPortUDP = UDP_SRC_PORT(),
+				srcPortTCP = TCP_SRC_PORT(),
+				//dstPortUDP = UDP_DST_PORT(),
+				dstPortTCP = TCP_DST_PORT(),
+				payloadLength = payloadLength(),
+				flagURGENT =TCP_FLAGS_URGENT(),
+				flagACK = TCP_FLAGS_ACK(),
+				flagPUSH =TCP_FLAGS_PUSH(), 
+				flagRESET = TCP_FLAGS_RESET(), 
+				flagSYN =TCP_FLAGS_SYN(), 
+				flagFIN = TCP_FLAGS_FIN(),
+				cppayload = payload() ;
+		}
+/*
+		() as Custom_3 = Custom(HeaderStream as inPort0Alias)
+		{
+			logic
+				onTuple inPort0Alias : printStringLn((rstring)HeaderStream.srcAddressIP) ;
+		}
+*/
+}

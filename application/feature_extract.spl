@@ -1,0 +1,230 @@
+namespace application;
+
+
+
+
+composite feature_Extract(output FeatureStream; input PCAP)
+{	graph
+		//three-way handshake
+		stream<Flow flow, boolean first> Filter_Three_way_shake = Custom(PCAP as In;BlockFlow) {
+			logic
+				state: {
+					mutable map<FlowID, uint8> counter;
+					mutable FlowID flowID;
+					mutable Flow outputFlow;
+				}
+				onTuple BlockFlow: {
+					println("block start");
+					removeM(counter, BlockFlow.flowID1);
+					println("block end");
+				}
+				onTuple In: {
+				
+					flowID = toFlowID(In);
+					if(In.flagSYN && !In.flagACK) {
+						//println("syn an ack");
+						// Handshake: SYN
+						//insertM(counter, flowID,1ub);
+						counter[flowID] = 1ub;
+					} else if(	In.flagSYN && In.flagACK && reverseFlowID(flowID) in counter && 
+								counter[reverseFlowID(flowID)] == 1ub) {	
+						// Handshake: SYN ACK
+						counter[reverseFlowID(flowID)] = 2ub;
+					} else if(	!In.flagSYN && In.flagACK && flowID in counter && 
+								counter[flowID] == 2ub) {
+						// Handshake: ACK
+						counter[flowID] = 3ub;
+					} else if(	(flowID in counter && counter[flowID] >= 3ub) ||
+								(reverseFlowID(flowID) in counter && counter[reverseFlowID(flowID)] >= 3ub)) {
+								
+						// Pass
+						if(reverseFlowID(flowID) in counter) {	
+							flowID = reverseFlowID(flowID);
+							outputFlow.direction = -1b;
+						} else
+							outputFlow.direction = 1b;
+						
+						outputFlow.flowID = flowID;
+						outputFlow.captureTime = In.captureTime;
+						outputFlow.payloadLength = In.payloadLength;
+						
+						// First packet (payload > 0) of this flow
+						if(counter[flowID] == 3ub && In.payloadLength > 0uh) {
+							counter[flowID]++;
+							submit({flow = outputFlow, first = true}, Filter_Three_way_shake);
+						} else if(In.payloadLength > 0uh)
+							submit({flow = outputFlow, first = false}, Filter_Three_way_shake);
+						
+				}
+			}
+		}
+
+//feature extraction
+	(stream<Feature> FeatureStream as Out;stream<FlowID flowID1> BlockFlow) = Custom(Filter_Three_way_shake as In) {
+		logic
+			state: {
+				mutable map<FlowID, int8> SSL_hand_shake;
+				mutable map<FlowID, int8> SSLcounter;
+				mutable map<FlowID, int8> SSLdir;
+				mutable map<FlowID, int32> first5count;
+				
+				mutable map<FlowID, int8> counter;
+				mutable map<FlowID, Feature> features;
+				mutable map<FlowID, float64> previousTime;
+				mutable FlowID flowID;					
+			}
+			onTuple In: {
+				flowID = flow.flowID;
+				if(In.first) {
+					//println("first initial");
+					SSL_hand_shake[flowID]=0b;
+					SSLdir[flowID]=0b;
+					first5count[flowID]=1;
+					counter[flowID] = flow.direction;
+					//create feature[flowID]
+					features[flowID] = {flowID = flowID, features = {"No.segA": 0f, "No.segB": 0f, "totalsizA": 0f, "totalsizB": 0f}};
+					
+					//SSL counter
+					if(flowID.dstPort==443uh||flowID.srcPort==443uh){
+						SSLcounter[flowID] = flow.direction;
+
+					}else{
+						SSLcounter[flowID]=8b;
+						SSL_hand_shake[flowID]=1b;
+						features[flowID].features['packet1']= (float64)flow.payloadLength;
+						first5count[flowID]+=1;
+					}
+				}else{
+
+					if((flow.flowID in first5count &&SSL_hand_shake[flowID]==1b)){
+						//println("packet update");
+						/*
+						if(flowID.srcAddr=="94.31.29.154"||flowID.dstAddr=="94.31.29.154"){
+							print("direct :");
+							print(flow.direction);
+							print(", size :");
+							println(flow.payloadLength);
+						}*/
+						if(first5count[flowID]<=5){
+							if(first5count[flowID]==2){
+								features[flowID].features['packet2']= (float64)flow.payloadLength;
+							}else if(first5count[flowID]==3){
+								features[flowID].features['packet3']= (float64)flow.payloadLength;
+							}else if(first5count[flowID]==4){
+								features[flowID].features['packet4']= (float64)flow.payloadLength;
+							}else if(first5count[flowID]==5){
+								features[flowID].features['packet5']= (float64)flow.payloadLength;
+							}else if(first5count[flowID]==1){
+								features[flowID].features['packet1']= (float64)flow.payloadLength;
+							}
+							first5count[flowID]+=1;
+						}
+						
+						
+					}
+					
+					if(SSLdir[flowID]==1b&& SSL_hand_shake[flowID]==1b){
+						counter[flowID]=flow.direction;
+						SSLdir[flowID]=0b;
+					}
+					
+				}
+				
+				
+				
+				
+				if(!(flow.flowID in counter)){
+					return;
+				}
+
+				// Count new talk, abs(value) would be 1ub, 2ub, 4ub 
+				if(flow.direction*counter[flowID] < 0b &&SSL_hand_shake[flowID]==1b){
+					//println("count new talk");'
+
+					if(abs(counter[flowID])<=4b){
+						counter[flowID] = counter[flowID] * -2b;
+						/*
+						if(flowID.srcAddr=="94.31.29.154"||flowID.dstAddr=="94.31.29.154"){
+							println(counter[flowID]);
+							println(flow.direction);
+						}*/
+					}
+
+				}
+				// Talk A			
+				if(abs(counter[flowID]) == 1b&&SSL_hand_shake[flowID]==1b) {
+					if(flowID.srcAddr=="94.31.29.154"||flowID.dstAddr=="94.31.29.154"){
+						println("Talk A");
+					}
+					features[flowID].features['No.segA'] += 1f;
+					features[flowID].features['totalsizA'] += (float64)flow.payloadLength;
+					
+				} 
+				// Talk B
+				else if(abs(counter[flowID]) == 2b&&SSL_hand_shake[flowID]==1b) {
+					if(flowID.srcAddr=="94.31.29.154"||flowID.dstAddr=="94.31.29.154"){
+						println("Talk B");
+					}
+					// First time				
+					features[flowID].features['No.segB'] += 1f;
+					features[flowID].features['totalsizB'] += (float64)flow.payloadLength;
+				}
+				//Talk C
+				else if(abs(counter[flowID]) == 4b&&SSL_hand_shake[flowID]==1b) {
+				/*
+					if(flowID.srcAddr=="94.31.29.154"||flowID.dstAddr=="94.31.29.154"){
+						println("Talk C");
+					}*/
+					features[flowID].features['sport'] = (float64)flow.flowID.srcPort;
+					features[flowID].features['dport'] = (float64)flow.flowID.dstPort;
+					//features[flowID].features['direct'] = (float64)flow.direction;
+					
+					features[flowID].features['No.segFr'] = features[flowID].features['No.segA'] + features[flowID].features['No.segB'];
+					features[flowID].features['totalsizFr'] = features[flowID].features['totalsizA'] + features[flowID].features['totalsizB'];
+					/*
+					if(flowID.srcAddr=="94.31.29.154"||flowID.dstAddr=="94.31.29.154"){
+						print("firstfive :");
+						println(first5count[flowID]);
+					}*/
+					
+				}
+				
+				if(abs(counter[flowID])>=4b &&first5count[flowID]>=6&&SSL_hand_shake[flowID]==1b){
+					if(flowID.srcAddr=="94.31.29.154"||flowID.dstAddr=="94.31.29.154"){
+						println("Talk submit");
+					}
+					submit(features[flowID], Out);
+					println(features[flowID].features);
+					println(flowID);
+					
+					//submit({flowID1=flowID}, BlockFlow);
+					// Clear
+					removeM(counter, flowID);
+					removeM(first5count, flowID);
+					removeM(features, flowID);
+				}
+			
+			
+			
+			
+			
+				if(!In.first){
+					if(flow.direction*SSLcounter[flowID] < 0b&&SSL_hand_shake[flowID]==0b){
+							//println("SSL update");
+							SSLcounter[flowID] = SSLcounter[flowID] * -2b;
+							//println(SSLcounter[flowID]);
+							if(abs(SSLcounter[flowID])==8b){
+								SSL_hand_shake[flowID]=1b;
+								SSLdir[flowID]=1b;
+							}
+					}
+				}
+			
+			
+			}
+			
+	}	
+//ssl three way hand shake
+
+
+}

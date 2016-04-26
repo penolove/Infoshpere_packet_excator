@@ -1,0 +1,185 @@
+namespace application;
+
+type FlowID	= rstring srcAddr, uint16 srcPort, rstring dstAddr, uint16 dstPort;
+type Flow	= FlowID flowID, int8 direction, float64 captureTime, uint16 payloadLength;
+
+type Feature = FlowID flowID, map<rstring, float64> features;			  
+
+FlowID toFlowID(TCPHeader header) {
+	return {
+		srcAddr = header.srcAddressIP, srcPort = header.srcPortTCP,
+		dstAddr = header.dstAddressIP, dstPort = header.dstPortTCP
+	};
+}
+FlowID reverseFlowID(FlowID flowID) {	
+	return {
+		srcAddr = flowID.dstAddr, srcPort = flowID.dstPort,
+		dstAddr = flowID.srcAddr, dstPort = flowID.srcPort
+	};
+}
+
+composite Feature_Extract(output FeatureStream; input PCAP)
+{	
+	graph		
+		
+	stream<Flow flow, boolean first> Filter_NewFlow as Out = Custom(PCAP as In; BlockFlow) {
+		logic
+			state: {
+				mutable map<FlowID, uint8> counter;
+				mutable FlowID flowID;
+				mutable Flow outputFlow;
+			}
+			onTuple BlockFlow: {
+				println("block start");
+				removeM(counter, BlockFlow.flowID);
+				println("block end");
+			}
+			onTuple In: {
+				//println("block start");
+				flowID = toFlowID(In);
+				if(In.flagSYN && !In.flagACK) {
+					//println("syn an ack");
+					// Handshake: SYN
+					insertM(counter, flowID,1ub);
+					//counter[flowID] = 1ub;
+				} else if(	In.flagSYN && In.flagACK && reverseFlowID(flowID) in counter && 
+							counter[reverseFlowID(flowID)] == 1ub) {	
+					// Handshake: SYN ACK
+					counter[reverseFlowID(flowID)] = 2ub;
+				} else if(	!In.flagSYN && In.flagACK && flowID in counter && 
+							counter[flowID] == 2ub) {
+					// Handshake: ACK
+					counter[flowID] = 3ub;
+				} else if(	(flowID in counter && counter[flowID] >= 3ub) ||
+							(reverseFlowID(flowID) in counter && counter[reverseFlowID(flowID)] >= 3ub)) {
+					// Pass
+					if(reverseFlowID(flowID) in counter) {	
+						flowID = reverseFlowID(flowID);
+						outputFlow.direction = -1b;
+					} else
+						outputFlow.direction = 1b;
+					
+					outputFlow.flowID = flowID;
+					outputFlow.captureTime = In.captureTime;
+					outputFlow.payloadLength = In.payloadLength;
+					
+					// First packet (payload > 0) of this flow
+					if(counter[flowID] == 3ub && In.payloadLength > 0uh) {
+						counter[flowID]++;
+						submit({flow = outputFlow, first = true}, Out);
+					} else {
+						submit({flow = outputFlow, first = false}, Out);
+					}
+					//removeM(counter, flowID);
+						
+				}
+			}
+	}
+	
+	stream<Flow flow, boolean first> Filter_DataPacket as Out = Filter(Filter_NewFlow as In) {
+		param
+			filter: In.flow.payloadLength > 0uh;
+	}
+	
+	(stream<Feature> FeatureStream as Out;stream<FlowID flowID> BlockFlow) = Custom(Filter_DataPacket as In) {
+		logic
+			state: {
+				mutable map<FlowID, int8> first5count;
+				mutable map<FlowID, int8> counter;
+				mutable map<FlowID, Feature> features;
+				mutable map<FlowID, float64> previousTime;
+				mutable FlowID flowID;					
+			}
+			onTuple In: {
+				flowID = flow.flowID;
+				if(In.first) {
+					first5count[flowID]=1b;
+					counter[flowID] = flow.direction;
+					features[flowID] = {flowID = flowID, features = {"No.segA": 0f, "No.segB": 0f, "totalsizA": 0f, "totalsizB": 0f}};
+					features[flowID].features['packet1']= (float64)flow.payloadLength;
+				}else{
+					first5count[flowID]+=1b;
+					if(first5count[flowID]==2b){
+						features[flowID].features['packet2']= (float64)flow.payloadLength;
+					}else if(first5count[flowID]==3b){
+						features[flowID].features['packet3']= (float64)flow.payloadLength;
+					}else if(first5count[flowID]==4b){
+						features[flowID].features['packet4']= (float64)flow.payloadLength;
+					}else if(first5count[flowID]==5b){
+						features[flowID].features['packet5']= (float64)flow.payloadLength;
+					}
+				}
+					
+				// Ignore after first two talk	
+				if(!(flow.flowID in counter))
+					return;
+				// Count new talk, abs(value) would be 1ub, 2ub, 4ub 
+				if(flow.direction*counter[flowID] < 0b)
+					counter[flowID] = counter[flowID] * -2b;
+				
+				// Talk A			
+				if(abs(counter[flowID]) == 1b) {
+					// First time
+					/*
+					if(features[flowID].features['No.segA'] == 0f) 
+						features[flowID].features['duringA'] = flow.captureTime;
+						*/											
+					features[flowID].features['No.segA'] += 1f;
+					features[flowID].features['totalsizA'] += (float64)flow.payloadLength;
+					
+					previousTime[flowID] = flow.captureTime;						
+				} 
+				// Talk B
+				else if(abs(counter[flowID]) == 2b) {
+					// First time
+					/*
+					if(features[flowID].features['No.segB'] == 0f) {
+						features[flowID].features['duringA'] = previousTime[flowID] - features[flowID].features['duringA'];
+						features[flowID].features['duringB'] = flow.captureTime;
+						//features[flowID].features['responsetime'] = flow.captureTime - previousTime[flowID];
+					}*/
+																	
+					features[flowID].features['No.segB'] += 1f;
+					features[flowID].features['totalsizB'] += (float64)flow.payloadLength;
+					
+					previousTime[flowID] = flow.captureTime;	
+				} 
+				// 3rd talk
+				else if(abs(counter[flowID]) == 4b) {
+					//features[flowID].features['duringB'] = previousTime[flowID] - features[flowID].features['duringB'];
+				
+					features[flowID].features['sport'] = (float64)flow.flowID.srcPort;
+					features[flowID].features['dport'] = (float64)flow.flowID.dstPort;
+					features[flowID].features['direct'] = (float64)flow.direction;
+					
+					features[flowID].features['No.segFr'] = features[flowID].features['No.segA'] + features[flowID].features['No.segB'];
+					features[flowID].features['totalsizFr'] = features[flowID].features['totalsizA'] + features[flowID].features['totalsizB'];
+					/*
+					features[flowID].features['thoughput.packA'] = (float64)features[flowID].features['No.segA'] / features[flowID].features['duringA'];
+					features[flowID].features['thoughput.packB'] = (float64)features[flowID].features['No.segB'] / features[flowID].features['duringB'];
+					features[flowID].features['thoughput.packR'] = (float64)features[flowID].features['No.segFr'] / (features[flowID].features['duringA']+features[flowID].features['duringB']);
+					features[flowID].features['thoughput.sizeA'] = (float64)features[flowID].features['totalsizA'] / features[flowID].features['duringA'];
+					features[flowID].features['thoughput.sizeB'] = (float64)features[flowID].features['totalsizB'] / features[flowID].features['duringB'];
+					features[flowID].features['thoughput.sizeR'] = (float64)features[flowID].features['totalsizFr'] / (features[flowID].features['duringA']+features[flowID].features['duringB']);
+					
+					if(features[flowID].features['No.segA'] == 1f)	features[flowID].features['talkA.inter'] = 0f;
+					else	features[flowID].features['talkA.inter'] = features[flowID].features['duringA'] / (features[flowID].features['No.segA']-1f);
+					if(features[flowID].features['No.segA'] == 1f)	features[flowID].features['talkB.inter'] = 0f;
+					else	features[flowID].features['talkB.inter'] = features[flowID].features['duringB'] / (features[flowID].features['No.segB']-1f);
+					*/
+					submit(features[flowID], Out);
+					println("sent Out");
+					
+					//submit({flowID = flowID}, BlockFlow);
+					println(flowID);
+					println(counter);
+					println(features);
+					println(counter[flowID]);
+					println(features);
+					// Clear
+					removeM(counter, flowID);
+					removeM(features, flowID);
+				}
+			}
+	}
+}

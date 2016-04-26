@@ -1,0 +1,196 @@
+namespace application ;
+
+type node_body = rstring label, list<rule_body> rules ;
+type rule_body = uint32 nextID, boolean gt, float64 value ;
+boolean regexIsMatchAll(rstring str, rstring pattern)
+{
+	if(length(regexReplace(str, pattern, "", false)) == 0 && length(str) != 0)
+		return true ;
+	else return false ;
+}
+
+uint32 matchRule(node_body node, map<rstring, float64> feature)
+{
+	for(rule_body rule in node.rules)
+	{	//printStringLn(node.label);
+		if(node.label in feature)
+		{	//printStringLn("in");
+			if(rule.gt && feature [ node.label ] > rule.value) return rule.nextID ;
+			//printStringLn("B");
+			if(! rule.gt && feature [ node.label ] <= rule.value) return rule.nextID ;
+			//printStringLn("B"+(rstring)node.rules);
+		}
+
+	}
+
+	return 0u ; 
+
+}
+public
+composite DTree_Classifier( output LabelStream,LatenStream ; input _FeatureStream)
+{
+	param
+		expression $filename ;
+	type
+		node = uint32 nodeID, rstring label ;
+		rule = uint32 nodeID, uint32 nextID, boolean gt, float64 value,
+			rstring label ;
+	graph
+		/*
+		stream<rstring line> rawTree = FileSource()
+		{
+			param
+				file : $filename ;
+				format : line ;
+				
+		}
+		*/
+		
+		 
+		stream<rstring line> rawTree = com.ibm.streamsx.hdfs::HDFS2FileSource()
+		{
+			param
+				hdfsUri : "hdfs://InvPM30:9000" ;
+				file : $filename ;
+			config placement: partitionColocation("AB");
+
+		}
+		
+		(stream<node> NodeStream ; stream<rule> RuleStream) = Custom(rawTree as In)
+		{
+			logic
+				state :
+				{
+					mutable node nodeOut ;
+					mutable rule ruleOut ;
+					rstring nodeMatch = '^N(\\w*) \\[.*label="([^"]*)".*\\]$' ;
+					rstring ruleMatch = '^N(\\w*)->N(\\w*) \\[.*label="([^"]*)".*\\]$' ;
+
+				}
+
+				onTuple In :
+				{	println(line);
+					if(regexIsMatchAll(line, nodeMatch))
+					{	printStringLn("111");
+						nodeOut.nodeID =(uint32) regexReplace(line, nodeMatch, "\\1", false) ;
+						nodeOut.label = regexReplace(line, nodeMatch, "\\2", false) ;
+
+						printStringLn("Node: " + (rstring)nodeOut.nodeID + ": " + nodeOut.label);
+						submit(nodeOut, NodeStream) ;
+					}
+
+					else if(regexIsMatchAll(line, ruleMatch))
+					{	printStringLn("2");
+						ruleOut.nodeID =(uint32) regexReplace(line, ruleMatch, "\\1", false) ;
+						ruleOut.nextID =(uint32) regexReplace(line, ruleMatch, "\\2", false) ;
+						ruleOut.label = regexReplace(line, ruleMatch, "\\3", false) ;
+						ruleOut.value =(float64) regexReplace(ruleOut.label, "^(.*) (\\0*.*w*)$",
+							"\\2", false) ;
+						if(regexReplace(ruleOut.label, "^(.*) (\\0*.*w*)$", "\\1", false) == ">")
+							ruleOut.gt = true ;
+						else ruleOut.gt = false ;
+
+						printStringLn("Rule: " + (rstring)ruleOut.nodeID + "->" + (rstring)ruleOut.nextID + ": " + (rstring)ruleOut.value);
+						submit(ruleOut, RuleStream) ;
+					}
+
+
+				}
+
+				onPunct In :
+				{
+					if(currentPunct() == Sys.FinalMarker)
+					{
+						submit(Sys.FinalMarker, NodeStream) ;
+						submit(Sys.FinalMarker, RuleStream) ;
+					}
+
+				}
+			config placement: partitionColocation("AB");
+				   
+			}
+		(stream <rstring topic ,rstring message> LatenStream ; stream<FlowID flowID, rstring label > LabelStream ; stream<int32 dummy>
+			ready) = Custom(NodeStream ; RuleStream ; FeatureStream)
+			{
+				logic
+					state :
+					{
+						mutable map<uint32, node_body> nodes ;
+						mutable boolean nodeReady = false ;
+						mutable boolean ruleReady = false ;
+						mutable uint32 nextPtr ;
+						mutable uint32 nodePtr ;
+					}
+
+					onTuple NodeStream :
+					{
+						if(!(nodeID in nodes)) insertM(nodes, nodeID, { label = label, rules
+							=(list<rule_body>) [ ] }) ;
+						else nodes [ nodeID ].label = label ;
+					}
+
+					onTuple RuleStream :
+					{
+					// If rule arrive before node
+						if(!(nodeID in nodes)) insertM(nodes, nodeID, { label = "", rules
+							=(list<rule_body>) [ ] }) ;
+						appendM(nodes [ nodeID ].rules, { nextID = nextID, gt = gt, value = value
+							}) ;
+					}
+
+					onTuple FeatureStream :
+					{
+						if(! nodeReady || ! ruleReady)
+						{
+							printStringLn("Not ready") ;
+							return ;
+						}
+
+						nodePtr = 0u ;
+						nextPtr = matchRule(nodes [ nodePtr ], FeatureStream.features) ;
+						while(nextPtr != 0u)
+						{
+							nodePtr = nextPtr ;
+							nextPtr = matchRule(nodes [ nodePtr ], FeatureStream.features) ;
+						}
+						//printStringLn(nodes [ nodePtr ].label+(rstring)nodePtr);
+						submit({ flowID = flowID, label = nodes [ nodePtr ].label },LabelStream) ;
+						submit({topic = "recordtp1", message = (rstring)FeatureStream.features["latenID"]}, LatenStream) ;
+							//printStringLn((rstring) nodePtr + ": " + nodes[nodePtr].label);
+
+					}
+
+					onPunct NodeStream :
+					{
+						if(currentPunct() == Sys.FinalMarker)
+						{
+							nodeReady = true ;
+							if(ruleReady) submit({ dummy = 1 }, ready) ;
+						}
+
+					}
+
+					onPunct RuleStream :
+					{
+						if(currentPunct() == Sys.FinalMarker)
+						{
+							ruleReady = true ;
+							if(nodeReady) submit({ dummy = 1 }, ready) ;
+						}
+
+					}
+				config placement: partitionColocation("AB");
+					   threadedPort: queue(FeatureStream,Sys.Wait);
+				}
+
+			(stream<Feature> FeatureStream) as LoadedSwitch = Switch(_FeatureStream ;
+					ready)
+				{
+					param
+						initialStatus : false ;
+						status : true ; // Any control tuple would make switch open
+					config placement: partitionColocation("AB");
+
+				}
+
+		}

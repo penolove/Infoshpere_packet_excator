@@ -1,0 +1,100 @@
+namespace application ;
+
+composite EAC
+{
+	graph
+		(stream<TCPHeader> PCAP) as Input = PCAP_Source()
+		{
+			param
+				filename : "/home/stream/strip.20151120-1.pcap" ;
+				filter : "tcp" ;
+			config
+				placement : host(distribute_trial) ;
+		}
+
+		() as JCP = JobControlPlane()
+		{
+		}
+
+		
+		(stream<Feature> FeatureStream) as FeatureExtractor = feature_Extract(PCAP)
+		{
+			config
+				placement : host(distribute_trial) ;
+		}
+
+
+	config
+		hostPool : distribute_trial = createPool({ tags = [ "distribute_trial" ],
+			size = 1 }, Sys.Exclusive) ;
+
+			/*
+		() as LabelSink1 = Custom(FeatureStream as In)
+		{
+			logic
+				onTuple In :
+				{
+					printString("[DTree1] ") ;
+					println(In.features) ;
+				}
+
+		}
+*/
+
+/* 
+		(stream<FlowID flowID, rstring label> LabelStream1; stream<rstring topic,rstring message> OutputStream1) as DTree1 =
+			DTree_Classifier(FeatureStream)
+		{
+			param
+				filename : "/home/streamsadmin/Desktop/Rscript/EAC/data/tree11.txt" ;
+		}
+
+		(stream<FlowID flowID, rstring label> LabelStream2; stream<rstring topic,rstring message> OutputStream) as DTree2 =
+			DTree_Classifier(FeatureStream)
+		{
+			param
+				filename : "/home/streamsadmin/Desktop/Rscript/EAC/data/tree11.txt" ;
+		}
+
+		() as LabelSink1 = Custom(LabelStream1 as In)
+		{
+			logic
+				onTuple In :
+				{
+					printString("[DTree1] ") ;
+					printStringLn((rstring) flowID.srcAddr + ":" +(rstring) flowID.srcPort +
+						" > " +(rstring) flowID.dstAddr + ":" +(rstring) flowID.dstPort + ": " +
+						label) ;
+				}
+
+		}
+
+		() as LabelSink2 = Custom(LabelStream2 as In)
+		{
+			logic
+				onTuple In :
+				{
+					printString("[DTree2] ") ;
+					printStringLn((rstring) flowID.srcAddr + ":" +(rstring) flowID.srcPort +
+						" > " +(rstring) flowID.dstAddr + ":" +(rstring) flowID.dstPort + ": " +
+						label) ;
+				}
+
+		}
+		/*
+		() as FeatureSink = Custom(FeatureStream as In) {
+			logic
+				onTuple In: {
+					printStringLn(
+						(rstring)flowID.srcAddr + ":" + (rstring) flowID.srcPort + ((features['direct']>0f)?" > ":" < ") + 
+						(rstring)flowID.dstAddr + ":" + (rstring) flowID.dstPort + ": "
+					);
+					for(rstring key in features) {
+						printStringLn("\t" + key + ": " + (rstring)features[key]);	
+					}
+				}
+		}
+		*/
+}
+
+
